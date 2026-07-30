@@ -6,9 +6,11 @@ structure through the real gates in prepare.py. Nothing is faked: the staircase
 in the UI is the actual ratchet, and the discarded points are structures that
 actually failed.
 
-    python simulate.py --n 80 --seed 7
+    python simulate.py --n 80 --seed 7          # a full run, as fast as it computes
+    python simulate.py --forever --interval 5   # the demo: keeps going until you stop it
 
-Writes experiments.jsonl, which serve.py reads and the dashboard renders.
+Each experiment is appended to experiments.jsonl the moment it is evaluated, so
+the dashboard picks it up on its next poll. serve.py reads that file.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -152,81 +155,29 @@ MOVES = [
 POOL = [m for m, w in MOVES for _ in range(w)]
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--n", type=int, default=80)
-    ap.add_argument("--seed", type=int, default=7)
-    args = ap.parse_args()
-    rng = random.Random(args.seed)
+def append(record: dict) -> None:
+    """One experiment, one line, closed immediately. The dashboard reads this
+    file on every poll, so an experiment is visible as soon as it is evaluated
+    rather than when the run ends."""
+    with LOG.open("a") as fh:
+        fh.write(json.dumps(record) + "\n")
 
-    best = BASELINE
-    base_ev = evaluate(POLICY, BASELINE, BASELINE)
-    best_metric = base_ev.metric
-    t0 = datetime.now(timezone.utc) - timedelta(minutes=6 * args.n)
 
-    records = [{
-        "n": 0, "ts": t0.isoformat(timespec="seconds"), "label": "baseline",
-        "metric": round(best_metric, 6), "best": round(best_metric, 6),
-        "kept": True, "acceptable": True, "failed_gates": [],
-        "action": "BASELINE", "verdict": "starting point", "structure": "baseline-RA",
-    }]
+def write_queue(records: list[dict], base_metric: float) -> int:
+    """The review queue: what a human is asked to sign off on.
 
-    n = 0
-    while n < args.n:
-        move = rng.choice(POOL)
-        got = move(best, rng)
-        if got is None:
-            continue
-        cand, label, knob = got
-        if knob:
-            cand = rebalance(cand, knob)
-        cand = replace(cand, name=f"exp-{n+1:03d}", notes=label)
-
-        ev = evaluate(POLICY, best, cand)   # judged against the incumbent
-        improved = ev.metric < best_metric - 1e-9
-        keep = improved and ev.accepted
-        n += 1
-
-        records.append({
-            "n": n,
-            "ts": (t0 + timedelta(minutes=6 * n)).isoformat(timespec="seconds"),
-            "label": label,
-            "metric": round(ev.metric, 6),
-            "best": round(min(best_metric, ev.metric) if keep else best_metric, 6),
-            "kept": keep,
-            "acceptable": ev.accepted,
-            "failed_gates": [{"gate": g.gate, "clause": g.clause, "detail": g.detail}
-                             for g in ev.failed_gates],
-            "action": "COMMIT" if keep else "REVERT",
-            "verdict": ev.verdict,
-            "structure": cand.name,
-            "table": {str(p): {k: round(v, 6) for k, v in ev.table[p].items()}
-                      for p in POLICY.disclosure_periods()},
-        })
-
-        if keep:
-            best, best_metric = cand, ev.metric
-            print(f"  [{n:3d}] KEEP  {ev.metric*100:6.3f}%  {label}")
-        else:
-            why = ev.failed_gates[0].clause if ev.failed_gates else "no gain"
-            print(f"  [{n:3d}] drop  {ev.metric*100:6.3f}%  {label}  ({why})")
-
-    LOG.write_text("\n".join(json.dumps(r) for r in records) + "\n")
-    kept = sum(1 for r in records if r["kept"]) - 1
-    print(f"\n{args.n} experiments, {kept} kept improvements")
-    print(f"baseline {base_ev.metric*100:.3f}%  ->  best {best_metric*100:.3f}%")
-    print(f"written to {LOG.name}")
-
-    # --- the review queue: what a human is asked to sign off on ---------------
+    Rewritten after every experiment, not once at the end, so the review lane
+    fills up while the run is going.
+    """
     committed = [r for r in records if r["kept"] and r["n"] > 0]
     notable = [r for r in records
-               if not r["acceptable"] and r["metric"] < base_ev.metric][:2]
+               if not r["acceptable"] and r["metric"] < base_metric][:2]
     queue = []
     for r in committed[-2:]:
         queue.append({
             "id": f"ACT-{100 + r['n']}", "track": "Quotations", "area": "EACs",
             "mode": "current method", "title": r["label"],
-            "delta_pp": round((r["metric"] - base_ev.metric) * 100, 3),
+            "delta_pp": round((r["metric"] - base_metric) * 100, 3),
             "metric": r["metric"], "gates_passed": 4, "gates_total": 4,
             "status": "ready", "experiment": r["n"],
         })
@@ -234,7 +185,7 @@ def main() -> None:
         queue.append({
             "id": f"ACT-{100 + r['n']}", "track": "Quotations", "area": "EACs",
             "mode": "experimental", "title": r["label"],
-            "delta_pp": round((r["metric"] - base_ev.metric) * 100, 3),
+            "delta_pp": round((r["metric"] - base_metric) * 100, 3),
             "metric": r["metric"],
             "gates_passed": 4 - len(r["failed_gates"]), "gates_total": 4,
             "status": "blocked",
@@ -242,7 +193,113 @@ def main() -> None:
             "experiment": r["n"],
         })
     QUEUE.write_text("\n".join(json.dumps(q) for q in queue) + "\n")
-    print(f"{len(queue)} items queued for review -> {QUEUE.name}")
+    return len(queue)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--n", type=int, default=80,
+                    help="how many experiments to run")
+    ap.add_argument("--forever", action="store_true",
+                    help="keep proposing experiments until interrupted (ctrl-c)")
+    ap.add_argument("--interval", type=float, default=0.0,
+                    help="seconds to wait between experiments. The dashboard polls "
+                         "every 4s, so 5 or so gives one new point per poll")
+    ap.add_argument("--seed", type=int, default=7)
+    args = ap.parse_args()
+    rng = random.Random(args.seed)
+
+    best = BASELINE
+    base_ev = evaluate(POLICY, BASELINE, BASELINE)
+    best_metric = base_ev.metric
+
+    # A paced run happens in real time, so the timestamps are the real ones. An
+    # unpaced run computes 80 experiments in about ten seconds, which would
+    # stack the whole staircase onto one instant -- so space those out at the
+    # 6 minutes a real training-style run would take.
+    live = args.interval > 0 or args.forever
+    now = datetime.now(timezone.utc)
+    t0 = now if live else now - timedelta(minutes=6 * args.n)
+
+    def stamp(n: int) -> str:
+        ts = datetime.now(timezone.utc) if live else t0 + timedelta(minutes=6 * n)
+        return ts.isoformat(timespec="seconds")
+
+    # Start a new run: truncate, then stream into it.
+    LOG.write_text("")
+    baseline_record = {
+        "n": 0, "ts": stamp(0), "label": "baseline",
+        "metric": round(best_metric, 6), "best": round(best_metric, 6),
+        "kept": True, "acceptable": True, "failed_gates": [],
+        "action": "BASELINE", "verdict": "starting point", "structure": "baseline-RA",
+    }
+    records = [baseline_record]
+    append(baseline_record)
+    write_queue(records, base_ev.metric)
+
+    if args.forever:
+        print("running until interrupted (ctrl-c)\n")
+
+    n = 0
+    interrupted = False
+    try:
+        while args.forever or n < args.n:
+            move = rng.choice(POOL)
+            got = move(best, rng)
+            if got is None:
+                continue
+            cand, label, knob = got
+            if knob:
+                cand = rebalance(cand, knob)
+            cand = replace(cand, name=f"exp-{n+1:03d}", notes=label)
+
+            ev = evaluate(POLICY, best, cand)   # judged against the incumbent
+            improved = ev.metric < best_metric - 1e-9
+            keep = improved and ev.accepted
+            n += 1
+
+            record = {
+                "n": n,
+                "ts": stamp(n),
+                "label": label,
+                "metric": round(ev.metric, 6),
+                "best": round(min(best_metric, ev.metric) if keep else best_metric, 6),
+                "kept": keep,
+                "acceptable": ev.accepted,
+                "failed_gates": [{"gate": g.gate, "clause": g.clause, "detail": g.detail}
+                                 for g in ev.failed_gates],
+                "action": "COMMIT" if keep else "REVERT",
+                "verdict": ev.verdict,
+                "structure": cand.name,
+                "table": {str(p): {k: round(v, 6) for k, v in ev.table[p].items()}
+                          for p in POLICY.disclosure_periods()},
+            }
+            records.append(record)
+            append(record)                       # visible to the dashboard now
+
+            if keep:
+                best, best_metric = cand, ev.metric
+                print(f"  [{n:3d}] KEEP  {ev.metric*100:6.3f}%  {label}", flush=True)
+            else:
+                why = ev.failed_gates[0].clause if ev.failed_gates else "no gain"
+                print(f"  [{n:3d}] drop  {ev.metric*100:6.3f}%  {label}  ({why})",
+                      flush=True)
+
+            write_queue(records, base_ev.metric)
+
+            if args.interval:
+                time.sleep(args.interval)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n  interrupted")
+
+    kept = sum(1 for r in records if r["kept"]) - 1
+    print(f"\n{n} experiments{' (stopped early)' if interrupted else ''}, "
+          f"{kept} kept improvements")
+    print(f"baseline {base_ev.metric*100:.3f}%  ->  best {best_metric*100:.3f}%")
+    print(f"written to {LOG.name}")
+    print(f"{write_queue(records, base_ev.metric)} items queued for review "
+          f"-> {QUEUE.name}")
 
 
 if __name__ == "__main__":
