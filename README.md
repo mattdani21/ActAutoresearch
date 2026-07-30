@@ -61,9 +61,38 @@ uv run report.py > report.md  # the handoff for the basis writer
 uv run ingest.py --days 7     # the literature lane (needs network)
 ```
 
-For the demo: leave `simulate.py` running in one terminal and `serve.py` in
-another. The dashboard polls every four seconds, so the staircase extends while
-you talk.
+## The demo: a loop that keeps running
+
+Two terminals. The dashboard first, then the loop:
+
+```bash
+uv run serve.py                              # terminal 1 — http://localhost:8420
+uv run simulate.py --forever --interval 5    # terminal 2 — until you ctrl-c it
+```
+
+`--forever` keeps proposing structures indefinitely; `--interval 5` paces them
+at one every five seconds. Each experiment is appended to `experiments.jsonl`
+the moment it is evaluated, and the dashboard polls every four seconds, so the
+staircase extends and the review lane fills while you talk. Ctrl-C stops it and
+prints the summary.
+
+Pick the interval for the room. Unpaced, 80 experiments take about ten seconds
+— fine for generating a log, useless to watch. At five seconds you get roughly
+one new point per poll, which is about the rate a person can narrate.
+
+What to point at while it runs:
+
+- Most points are grey. The loop rejects far more than it keeps — 61 of the 80
+  in the checked-in run failed clause **3.1.6.2** alone.
+- A rejected point sitting *below* the current best is the argument for the
+  whole architecture: it scored better and was reverted anyway, because the
+  saving was only there where the Standard takes its measurements.
+- The best-so-far line only ever steps down, and only through a structure that
+  cleared all four gates.
+
+`--n 80` without `--interval` is still the way to regenerate the checked-in log;
+it produces exactly the run in `experiments.jsonl` today, timestamped as though
+each experiment took six minutes.
 
 ## Layout
 

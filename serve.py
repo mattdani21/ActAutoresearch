@@ -30,9 +30,21 @@ PAPERS = HERE / "queue.jsonl"          # written by ingest.py
 
 
 def jsonl(path: Path) -> list[dict]:
+    """Skip anything that does not parse. simulate.py appends to these files
+    while the dashboard is polling them, so a read can land mid-write and catch
+    a partial last line. Dropping it means the next poll picks it up, which is
+    better than a 500 in front of the room."""
     if not path.exists():
         return []
-    return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+    out = []
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
 
 
 def state() -> dict:
