@@ -1,91 +1,119 @@
-# autoresearch
+# ActAutoresearch
 
-![teaser](progress.png)
+Karpathy's autoresearch loop pointed at the ASISA Standard on Effective Annual
+Cost instead of a language model, with a dashboard for the humans who have to
+sign off on what it finds.
 
-*One day, frontier AI research used to be done by meat computers in between eating, sleeping, having other fun, and synchronizing once in a while using sound wave interconnect in the ritual of "group meeting". That era is long gone. Research is now entirely the domain of autonomous swarms of AI agents running across compute cluster megastructures in the skies. The agents claim that we are now in the 10,205th generation of the code base, in any case no one could tell if that's right or wrong as the "code" is now a self-modifying binary that has grown beyond human comprehension. This repo is the story of how it all began. -@karpathy, March 2026*.
+## The mapping
 
-The idea: give an AI agent a small but real LLM training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats. You wake up in the morning to a log of experiments and (hopefully) a better model. The training code here is a simplified single-GPU implementation of [nanochat](https://github.com/karpathy/nanochat). The core idea is that you're not touching any of the Python files like you normally would as a researcher. Instead, you are programming the `program.md` Markdown files that provide context to the AI agents and set up your autonomous research org. The default `program.md` in this repo is intentionally kept as a bare bones baseline, though it's obvious how one would iterate on it over time to find the "research org code" that achieves the fastest research progress, how you'd add more agents to the mix, etc. A bit more context on this project is here in this [tweet](https://x.com/karpathy/status/2029701092347630069) and [this tweet](https://x.com/karpathy/status/2031135152349524125).
+| autoresearch | here |
+|---|---|
+| `prepare.py` fixed, defines the metric | `prepare.py` — the EAC engine **and the four acceptability gates** |
+| `train.py` the agent rewrites it | `train.py` — the proposed charge structure |
+| `program.md` the human writes it | `program.md` — the research brief and the rules |
+| metric `val_bpb` | mean disclosed EAC across 1, 3, 5 yr and term to age 55 |
+| ratchet: keep if loss improved | ratchet: keep if EAC improved **and** all four gates pass |
 
-## How it works
+## The one change that matters
 
-The repo is deliberately kept small and only really has three files that matter:
+```
+ARE MY EACs GETTING LOWER?   Y/N
+  IF Y: WHY?
+        IS IT ACCEPTABLE?    Y/N
+          IF Y: COMMIT TO MAIN
+```
 
-- **`prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). Not modified.
-- **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
-- **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
+"Acceptable" is four tests enforcing the Standard's own anti-manipulation
+clauses, not a judgement call:
 
-By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
+| gate | clause | asks |
+|---|---|---|
+| G1 revenue neutrality | internal | same provider charge PV, so it is like-for-like — and no cumulative drift |
+| G2 artefact test | **3.1.6.2** | does the saving survive growth rates 2–12% and holding periods off the mandatory measurement points? |
+| G3 external benefit | **3.1.16** | is the reduction funded outside the product? |
+| G4 charge-shifting | **3.1.12 / 3.1.13** | did the component split move while the total did not? |
 
-If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/status/2030720614752039185) looks pretty good for a lot more context.
+Two design points worth knowing, because both are easy to get wrong:
 
-## Quick start
+- **Gates judge each candidate against the incumbent, not the original
+  baseline.** Judging against the baseline lets a gaming move ride in on the
+  back of earlier honest gains — it still looks better than where you started.
+- **The agent may not edit `prepare.py`.** An agent that can rewrite its own
+  scoring function finds the lowest EAC in four minutes and every one of them is
+  worthless. That separation is the governance argument.
 
-**Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/).
+## Run it
+
+**Requirements:** Python 3.10+ and [uv](https://docs.astral.sh/uv/). The only
+dependency is SciPy — the RIY root-solve needs `brentq`. The dashboard is
+standard library only.
 
 ```bash
+uv sync                       # install (once)
 
-# 1. Install uv project manager (if you don't already have it)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# 2. Install dependencies
-uv sync
-
-# 3. Download data and train tokenizer (one-time, ~2 min)
-uv run prepare.py
-
-# 4. Manually run a single training experiment (~5 min)
-uv run train.py
+uv run prepare.py             # baseline EAC table
+uv run train.py               # evaluate the current proposal against the gates
+uv run run.py                 # one ratchet step from train.py
+uv run run.py --demo          # the four pre-baked candidates in candidates.py
+uv run simulate.py --n 80     # a real run: 80 evaluations through the real gates
+uv run serve.py               # dashboard at http://localhost:8420
+uv run report.py > report.md  # the handoff for the basis writer
+uv run ingest.py --days 7     # the literature lane (needs network)
 ```
 
-If the above commands all work ok, your setup is working and you can go into autonomous research mode.
+For the demo: leave `simulate.py` running in one terminal and `serve.py` in
+another. The dashboard polls every four seconds, so the staircase extends while
+you talk.
 
-## Running the agent
-
-Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
-
-```
-Hi have a look at program.md and let's kick off a new experiment! let's do the setup first.
-```
-
-The `program.md` file is essentially a super lightweight "skill".
-
-## Project structure
+## Layout
 
 ```
-prepare.py      — constants, data prep + runtime utilities (do not modify)
-train.py        — model, optimizer, training loop (agent modifies this)
-program.md      — agent instructions
-pyproject.toml  — dependencies
+prepare.py         — the EAC engine and the four gates (agent must not modify)
+train.py           — the proposed charge structure (the one file the agent edits)
+program.md         — the research brief and the rules (the human edits this)
+run.py             — the ratchet: lower? why? acceptable? commit or revert
+simulate.py        — generates a full run of real evaluations
+candidates.py      — four hand-built structures: one honest, three that game a clause
+report.py          — the spike report for the basis writer
+ingest.py          — ranks new arXiv papers against the department's rubric
+serve.py           — dashboard backend, standard library only
+ui/index.html      — the dashboard
+experiments.jsonl  — the log of a completed 80-experiment run
+review_queue.jsonl — what a human is asked to sign off on
+tracks.json        — the department's research tracks, as shown in the dashboard
+report.md          — a generated spike report, checked in as an example
 ```
 
-## Design choices
+`run.py` and `serve.py` also write `best.json`, `decisions.jsonl` and
+`queue.jsonl`. Those are loop state, not source, and are gitignored.
 
-- **Single file to modify.** The agent only touches `train.py`. This keeps the scope manageable and diffs reviewable.
-- **Fixed time budget.** Training always runs for exactly 5 minutes, regardless of your specific platform. This means you can expect approx 12 experiments/hour and approx 100 experiments while you sleep. There are two upsides of this design decision. First, this makes experiments directly comparable regardless of what the agent changes (model size, batch size, architecture, etc). Second, this means that autoresearch will find the most optimal model for your platform in that time budget. The downside is that your runs (and results) become not comparable to other people running on other compute platforms.
-- **Self-contained.** No external dependencies beyond PyTorch and a few small packages. No distributed training, no complex configs. One GPU, one file, one metric.
+## What the loop found
 
-## Platform support
+80 experiments, 12 kept, baseline 5.105% → 2.331% mean disclosed EAC. Almost all
+of the gain is removing front-loading: the year-1 EAC on the baseline is 11.06%
+against 2.38% at term, and nearly all of that gap is the RIY treatment of an
+upfront advice charge over a small first-year fund.
 
-This code currently requires that you have a single NVIDIA GPU. In principle it is quite possible to support CPU, MPS and other platforms but this would also bloat the code. I'm not 100% sure that I want to take this on personally right now. People can reference (or have their agents reference) the full/parent nanochat repository that has wider platform support and shows the various solutions (e.g. a Flash Attention 3 kernels fallback implementation, generic device support, autodetection, etc.), feel free to create forks or discussions for other platforms and I'm happy to link to them here in the README in some new notable forks section or etc.
+61 of the 80 were rejected under clause 3.1.6.2 — the saving existed only where
+the Standard takes its measurements. Those rejections are the output a reviewer
+should actually read.
 
-Seeing as there seems to be a lot of interest in tinkering with autoresearch on much smaller compute platforms than an H100, a few extra words. If you're going to try running autoresearch on smaller computers (Macbooks etc.), I'd recommend one of the forks below. On top of this, here are some recommendations for how to tune the defaults for much smaller models for aspiring forks:
+## Caveats to say out loud
 
-1. To get half-decent results I'd use a dataset with a lot less entropy, e.g. this [TinyStories dataset](https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean). These are GPT-4 generated short stories. Because the data is a lot narrower in scope, you will see reasonable results with a lot smaller models (if you try to sample from them after training).
-2. You might experiment with decreasing `vocab_size`, e.g. from 8192 down to 4096, 2048, 1024, or even - simply byte-level tokenizer with 256 possibly bytes after utf-8 encoding.
-3. In `prepare.py`, you'll want to lower `MAX_SEQ_LEN` a lot, depending on the computer even down to 256 etc. As you lower `MAX_SEQ_LEN`, you may want to experiment with increasing `DEVICE_BATCH_SIZE` in `train.py` slightly to compensate. The number of tokens per fwd/bwd pass is the product of these two.
-4. Also in `prepare.py`, you'll want to decrease `EVAL_TOKENS` so that your validation loss is evaluated on a lot less data.
-5. In `train.py`, the primary single knob that controls model complexity is the `DEPTH` (default 8, here). A lot of variables are just functions of this, so e.g. lower it down to e.g. 4.
-6. You'll want to most likely use `WINDOW_PATTERN` of just "L", because "SSSL" uses alternating banded attention pattern that may be very inefficient for you. Try it.
-7. You'll want to lower `TOTAL_BATCH_SIZE` a lot, but keep it powers of 2, e.g. down to `2**14` (~16K) or so even, hard to tell.
+Charge data is synthetic. The literature lane is real. Revenue neutrality is PV
+of charges, not a profit model — new business strain and commission regulation
+are out of scope and may dominate. Persistency is not modelled, so the claim
+that most investors do not hold an RA to age 55 is asserted, not evidenced. The
+engine is a clean-room implementation of the Standard for demonstration, not a
+production EAC calculator.
 
-I think these would be the reasonable hyperparameters to play with. Ask your favorite coding agent for help and copy paste them this guide, as well as the full source code.
+## Provenance
 
-## Notable forks
-
-- [miolini/autoresearch-macos](https://github.com/miolini/autoresearch-macos) (MacOS)
-- [trevin-creator/autoresearch-mlx](https://github.com/trevin-creator/autoresearch-mlx) (MacOS)
-- [jsegov/autoresearch-win-rtx](https://github.com/jsegov/autoresearch-win-rtx) (Windows)
-- [andyluo7/autoresearch](https://github.com/andyluo7/autoresearch) (AMD)
+The loop structure is Karpathy's
+[autoresearch](https://github.com/karpathy/autoresearch) — fixed scorer, one
+agent-editable file, a Markdown program the human iterates on, a ratchet that
+keeps or discards. Everything measured here is the EAC engine, not a language
+model, and the ratchet has a second condition the original does not need.
 
 ## License
 
