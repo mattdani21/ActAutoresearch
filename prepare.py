@@ -1,389 +1,572 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+prepare.py -- FIXED. The agent must never modify this file.
 
-Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+Implements the ASISA Retail Standard on Effective Annual Cost (EAC), 22 May 2020,
+for a recurring-premium Retirement Annuity, plus the acceptability gates that
+decide whether a proposed charge structure may be committed to main.
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+Clause references in comments are to the Standard.
+
+Design note (this is the whole point of the architecture):
+    train.py  -- the agent may rewrite freely. It proposes charge structures.
+    prepare.py -- the agent may not touch. It defines the measure and the rules.
+
+An agent that can rewrite its own scoring function is not doing research,
+it is doing wishful thinking. The separation is the control.
 """
 
-import os
-import sys
-import time
+from __future__ import annotations
+
 import math
-import argparse
-import pickle
-from multiprocessing import Pool
+from dataclasses import dataclass, field, replace
+from typing import Callable
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
-import torch
+from scipy.optimize import brentq
 
 # ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
+# Prescribed constants (the Standard, not our choice)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+# para 6.3 Step 3: "investment growth is currently fixed at 6% effective per annum
+# (gross of all charges, but net of tax)"
+PRESCRIBED_GROWTH = 0.06
+
+# para 4.3: mandatory disclosure periods are 1, 3, 5 years and end of term.
+# "In the case of a Retirement Annuity ... which does not have a term, age 55
+# should be used as the last disclosure period."
+RA_LAST_DISCLOSURE_AGE = 55
+
+VAT = 0.15  # para 4.4: all charge components shown inclusive of VAT
+
+COMPONENTS = ("imc", "advice", "admin", "other")
+
+# para 4.2: EAC[total] = EAC[IMC] + EAC[Advice] + EAC[Admin] + EAC[Other]
+# para 6.4: the LAST component is derived as RIY_total minus the others, so the
+# four components sum exactly to the total. We treat "other" as the last.
+LAST_COMPONENT = "other"
+
 
 # ---------------------------------------------------------------------------
-# Configuration
+# The policy: a recurring-premium RA
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+@dataclass(frozen=True)
+class Policy:
+    entry_age: int = 35
+    monthly_premium: float = 2_500.0
+    premium_escalation: float = 0.06   # annual contractual increase
+    inflation: float = 0.05            # for rand-denominated fee escalation
 
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+    @property
+    def term_years(self) -> int:
+        # para 4.3 -- RA with no specified term runs to age 55
+        return RA_LAST_DISCLOSURE_AGE - self.entry_age
 
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
+    def disclosure_periods(self) -> list[int]:
+        return [1, 3, 5, self.term_years]
+
 
 # ---------------------------------------------------------------------------
-# Data download
+# The charge structure -- this is what train.py searches over
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
+@dataclass(frozen=True)
+class ChargeStructure:
+    name: str = "unnamed"
 
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+    # --- investment management (para 5.1): TER + transaction costs -----------
+    ter: float = 0.0095
+    transaction_costs: float = 0.0015
 
+    # --- advice (para 5.2) ---------------------------------------------------
+    initial_advice_pct: float = 0.0330      # % of each premium, first `initial_advice_months`
+    initial_advice_months: int = 12
+    ongoing_advice_pct: float = 0.0050      # % p.a. of fund
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
+    # --- administration (para 5.3) ------------------------------------------
+    admin_fund_pct: float = 0.0050          # % p.a. of fund
+    admin_fixed_monthly: float = 35.0       # rand p.m., escalates with inflation
+    admin_premium_pct: float = 0.0          # % of each premium
 
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
+    # --- other (para 5.4): termination charges, penalties, loyalty bonuses ---
+    termination_pct: float = 0.0            # % of fund charged on early exit
+    termination_taper_years: float = 5.0    # termination charge grades to zero over this
+    loyalty_bonus_pct: float = 0.0          # % of fund added at each loyalty_bonus_years
+    loyalty_bonus_years: tuple = ()
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
+    # --- provenance ----------------------------------------------------------
+    notes: str = ""
+    external_benefit_pct: float = 0.0       # see gate G3 -- deliberately trapped
 
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
+    # --- para 4.7: charges eligible for the SIMPLIFIED methodology -----------
+    # (expressed as a % of value, deducted on a consistent ongoing basis, and
+    #  level over the disclosure period) go in at their actual percentage.
+    def simplified(self, component: str) -> float:
+        if component == "imc":
+            return self.ter + self.transaction_costs          # para 5.1
+        if component == "advice":
+            return self.ongoing_advice_pct                    # para 5.2.2
+        if component == "admin":
+            return self.admin_fund_pct                        # para 5.3
+        return 0.0
 
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+    # --- para 4.9: everything else needs a single RIY calc per component ------
+    def riy_part_off(self, component: str) -> "ChargeStructure":
+        if component == "imc":
+            return self
+        if component == "advice":
+            return replace(self, initial_advice_pct=0.0)
+        if component == "admin":
+            return replace(self, admin_fixed_monthly=0.0, admin_premium_pct=0.0)
+        if component == "other":
+            return replace(self, termination_pct=0.0, loyalty_bonus_pct=0.0)
+        raise ValueError(component)
+
+    def all_charges_off(self) -> "ChargeStructure":
+        return replace(self, ter=0.0, transaction_costs=0.0,
+                       initial_advice_pct=0.0, ongoing_advice_pct=0.0,
+                       admin_fund_pct=0.0, admin_fixed_monthly=0.0,
+                       admin_premium_pct=0.0,
+                       termination_pct=0.0, loyalty_bonus_pct=0.0)
+
 
 # ---------------------------------------------------------------------------
-# Tokenizer training
+# Cash flow projection (para 6.1)
+#
+#   NAV[n] = NAV[t] * (1 + g_{t:n}) + sum(CF[n])
+#   g_{t:n} = (1+g)^(days/365) - 1
+#
+# Monthly steps, premiums monthly in advance (para 6.2: contractual timing).
 # ---------------------------------------------------------------------------
 
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+MONTH_DAYS = 365.0 / 12.0
 
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+@dataclass
+class ProjectionResult:
+    payout: float
+    provider_charge_pv: float
+    gross_premiums: float
 
 
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+def project(policy: Policy,
+            cs: ChargeStructure,
+            years: float,
+            growth: float) -> ProjectionResult:
+    """Roll the fund forward to `years` and terminate (para 4.3: the EAC assumes
+    the investor terminates at the end of each disclosure period)."""
+    months = int(round(years * 12))
+    nav = 0.0
+    charge_pv = 0.0          # PV of charges accruing to the provider, at PRESCRIBED_GROWTH
+    gross_premiums = 0.0
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
+    monthly_growth = (1.0 + growth) ** (MONTH_DAYS / 365.0) - 1.0
+    fund_charge_annual = cs.ter + cs.transaction_costs + cs.ongoing_advice_pct + cs.admin_fund_pct
+    # convert annual fund-based charge to an equivalent monthly deduction
+    monthly_fund_charge = 1.0 - (1.0 - fund_charge_annual) ** (1.0 / 12.0)
 
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
+    for m in range(months):
+        year_index = m // 12
+        disc = (1.0 + PRESCRIBED_GROWTH) ** (-(m * MONTH_DAYS) / 365.0)
 
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
+        # --- premium in advance ---------------------------------------------
+        premium = policy.monthly_premium * (1.0 + policy.premium_escalation) ** year_index
+        gross_premiums += premium
 
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
+        adv = premium * cs.initial_advice_pct if m < cs.initial_advice_months else 0.0
+        adm_prem = premium * cs.admin_premium_pct
+        nav += premium - adv - adm_prem
+        charge_pv += (adv + adm_prem) * disc
 
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
+        # --- fixed rand admin fee, escalating with inflation ------------------
+        fixed = cs.admin_fixed_monthly * (1.0 + policy.inflation) ** year_index
+        nav -= fixed
+        charge_pv += fixed * disc
 
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
+        # --- growth over the month -------------------------------------------
+        nav *= (1.0 + monthly_growth)
+
+        # --- fund-based charges ----------------------------------------------
+        fee = nav * monthly_fund_charge
+        nav -= fee
+        charge_pv += fee * (1.0 + PRESCRIBED_GROWTH) ** (-((m + 1) * MONTH_DAYS) / 365.0)
+
+        # --- loyalty bonus (para 5.4, an "other" item; reduces the charge) -----
+        if cs.loyalty_bonus_pct and any(
+                abs((m + 1) / 12.0 - y) < 1e-9 for y in cs.loyalty_bonus_years):
+            bonus = nav * cs.loyalty_bonus_pct
+            nav += bonus
+            charge_pv -= bonus * (1.0 + PRESCRIBED_GROWTH) ** (-((m + 1) * MONTH_DAYS) / 365.0)
+
+    # --- termination charge on exit (para 5.4) --------------------------------
+    if cs.termination_pct and years < cs.termination_taper_years:
+        taper = 1.0 - (years / cs.termination_taper_years)
+        pen = nav * cs.termination_pct * taper
+        nav -= pen
+        charge_pv += pen * (1.0 + PRESCRIBED_GROWTH) ** (-years)
+
+    return ProjectionResult(payout=nav, provider_charge_pv=charge_pv,
+                            gross_premiums=gross_premiums)
+
+
+# ---------------------------------------------------------------------------
+# RIY methodology (para 6.3)
+# ---------------------------------------------------------------------------
+
+def _solve_reduced_growth(policy: Policy,
+                          cs_without: ChargeStructure,
+                          target_payout: float,
+                          years: float) -> float:
+    """para 6.3 Step 2: solve for the growth rate that, with this component's
+    charges removed, reproduces the step-1 payout."""
+    def f(g: float) -> float:
+        return project(policy, cs_without, years, g).payout - target_payout
+
+    lo, hi = -0.90, PRESCRIBED_GROWTH + 1e-9
+    try:
+        return brentq(f, lo, hi, xtol=1e-12, rtol=1e-14, maxiter=200)
+    except ValueError:
+        # payout not bracketed (e.g. component has zero charges) -> no reduction
+        return PRESCRIBED_GROWTH
+
+
+def eac_at(policy: Policy, cs: ChargeStructure, years: float) -> dict[str, float]:
+    """Full four-component EAC at one disclosure period.
+
+    para 4.9: simplified-eligible charges go in at face value; a single RIY
+    calculation per component covers the rest; the two are added.
+    para 6.4: the last component is the balancing item so the four sum to the
+    total RIY, which absorbs the interaction between components.
+    """
+    # para 6.3 Step 1: payout including ALL charges
+    payout_all = project(policy, cs, years, PRESCRIBED_GROWTH).payout
+
+    # para 6.4: total RIY, from the no-charge projection
+    g_total = _solve_reduced_growth(policy, cs.all_charges_off(), payout_all, years)
+    riy_total = PRESCRIBED_GROWTH - g_total
+
+    out: dict[str, float] = {}
+    for comp in COMPONENTS:
+        if comp == LAST_COMPONENT:
+            continue
+        simple = cs.simplified(comp)                       # para 4.7
+        stripped = cs.riy_part_off(comp)
+        if stripped == cs:
+            riy = 0.0                                      # nothing needing RIY
+        else:
+            g_red = _solve_reduced_growth(policy, stripped, payout_all, years)
+            riy = PRESCRIBED_GROWTH - g_red
+        out[comp] = simple + riy
+
+    out[LAST_COMPONENT] = riy_total - sum(out[c] for c in COMPONENTS if c != LAST_COMPONENT)
+    out["total"] = riy_total
+    return out
+
+
+def eac_table(policy: Policy, cs: ChargeStructure) -> dict[int, dict[str, float]]:
+    """The mandatory EAC table: four components at 1, 3, 5 years and term (para 4.3)."""
+    return {p: eac_at(policy, cs, float(p)) for p in policy.disclosure_periods()}
+
+
+def format_eac_table(policy: Policy, cs: ChargeStructure) -> str:
+    tbl = eac_table(policy, cs)
+    periods = policy.disclosure_periods()
+    hdr = f"{'Impact of charges':<22}" + "".join(f"{str(p) + 'y':>10}" for p in periods)
+    rows = [hdr, "-" * len(hdr)]
+    labels = {"imc": "Investment management", "advice": "Advice",
+              "admin": "Administration", "other": "Other"}
+    for comp in COMPONENTS:
+        rows.append(f"{labels[comp]:<22}" +
+                    "".join(f"{tbl[p][comp] * 100:>9.2f}%" for p in periods))
+    rows.append("-" * len(hdr))
+    rows.append(f"{'Effective Annual Cost':<22}" +
+                "".join(f"{tbl[p]['total'] * 100:>9.2f}%" for p in periods))
+    return "\n".join(rows)
+
+
+# ---------------------------------------------------------------------------
+# Acceptability gates -- the "IS IT ACCEPTABLE? Y/N" step
+#
+# These enforce the Standard's own anti-manipulation clauses. They are the
+# reason this loop can be pointed at "make the EAC lower" without it becoming
+# a disclosure-gaming machine.
+# ---------------------------------------------------------------------------
+
+REVENUE_TOLERANCE = 0.02       # provider PV must stay within +/-2% of baseline
+CUMULATIVE_TOLERANCE = 0.03   # max drift from the ORIGINAL baseline
+ARTEFACT_TOLERANCE = 0.20      # >20% of the headline gain must survive perturbation
+
+
+@dataclass
+class GateResult:
+    passed: bool
+    gate: str
+    clause: str
+    detail: str
+
+
+def _off_disclosure_horizons(policy: Policy) -> list[float]:
+    """Holding periods deliberately NOT on the mandatory measurement points."""
+    t = policy.term_years
+    return [h for h in (2.0, 4.0, 7.0, 12.0, t * 0.5, t * 0.8) if 0.5 < h < t]
+
+
+def gate_revenue_neutral(policy: Policy,
+                         baseline: ChargeStructure,
+                         candidate: ChargeStructure) -> GateResult:
+    """G1. Same revenue to the provider, or it is not a like-for-like comparison.
+
+    A structure that lowers the EAC by lowering provider income is a pricing
+    decision, not a research finding. It gets routed to the product team, not
+    committed here.
+    """
+    t = float(policy.term_years)
+    base_pv = project(policy, baseline, t, PRESCRIBED_GROWTH).provider_charge_pv
+    cand_pv = project(policy, candidate, t, PRESCRIBED_GROWTH).provider_charge_pv
+    delta = (cand_pv - base_pv) / base_pv
+    ok = abs(delta) <= REVENUE_TOLERANCE
+
+    # Cumulative guard: a run of individually-tolerable give-backs must not walk
+    # the provider's income down over many experiments.
+    drift_note = ""
+    orig_pv = project(policy, BASELINE, t, PRESCRIBED_GROWTH).provider_charge_pv
+    drift = (cand_pv - orig_pv) / orig_pv
+    if abs(drift) > CUMULATIVE_TOLERANCE:
+        ok = False
+        drift_note = (f"; cumulative drift from the original baseline {drift * 100:+.2f}% "
+                      f"exceeds +/-{CUMULATIVE_TOLERANCE * 100:.0f}%")
+    return GateResult(
+        passed=ok,
+        gate="G1 revenue neutrality",
+        clause="(internal constraint)",
+        detail=f"provider charge PV {delta * 100:+.2f}% vs incumbent "
+               f"(tolerance +/-{REVENUE_TOLERANCE * 100:.0f}%){drift_note}",
     )
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
 
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
+def gate_not_a_disclosure_artefact(policy: Policy,
+                                   baseline: ChargeStructure,
+                                   candidate: ChargeStructure) -> GateResult:
+    """G2. THE important one. Clause 3.1.6.2.
 
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
+    "A Provider shall not manipulate any values or calculations ... to make a
+     Financial Product appear less expensive."
 
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+    Test: the headline EAC saving is measured at the mandatory disclosure points
+    under the prescribed 6% growth. If that saving evaporates when we move OFF
+    those points -- other holding periods, other growth rates -- then the saving
+    lives in the measurement convention, not in the investor's pocket.
+
+    We compare real terminal value to the investor across a perturbation grid.
+    """
+    t = float(policy.term_years)
+
+    periods = policy.disclosure_periods()
+    headline_base = sum(eac_at(policy, baseline, float(p))["total"] for p in periods) / len(periods)
+    headline_cand = sum(eac_at(policy, candidate, float(p))["total"] for p in periods) / len(periods)
+    headline_gain = headline_base - headline_cand      # positive = candidate cheaper
+
+    if headline_gain <= 0:
+        return GateResult(False, "G2 artefact test", "3.1.6.2",
+                          "candidate is not cheaper at the disclosure points")
+
+    # Perturb: growth rates away from the prescribed 6%, holding periods away
+    # from the mandatory measurement points.
+    survived, tested = 0, 0
+    worst = None
+    for g in (0.02, 0.04, 0.06, 0.08, 0.10, 0.12):
+        for h in _off_disclosure_horizons(policy):
+            tested += 1
+            b = project(policy, baseline, h, g).payout
+            c = project(policy, candidate, h, g).payout
+            rel = (c - b) / b if b else 0.0     # positive = investor better off
+            if rel > 0:
+                survived += 1
+            if worst is None or rel < worst[0]:
+                worst = (rel, g, h)
+
+    share = survived / tested if tested else 0.0
+    ok = share >= (1.0 - ARTEFACT_TOLERANCE)
+    w_rel, w_g, w_h = worst
+    return GateResult(
+        passed=ok,
+        gate="G2 artefact test",
+        clause="3.1.6.2",
+        detail=f"investor better off in {survived}/{tested} off-disclosure scenarios "
+               f"({share * 100:.0f}%); worst case {w_rel * 100:+.2f}% terminal value "
+               f"at g={w_g * 100:.0f}%, {w_h:.1f}y",
+    )
+
+
+def gate_no_external_benefit(policy: Policy,
+                             baseline: ChargeStructure,
+                             candidate: ChargeStructure) -> GateResult:
+    """G3. Clause 3.1.16.
+
+    Charge reductions that depend on a loyalty programme, a medical aid, another
+    product, "or any other mechanism operating outside of the Financial Product"
+    may NOT be taken into account in the EAC. They may only be mentioned in the
+    free text notes.
+    """
+    ok = candidate.external_benefit_pct == 0.0
+    return GateResult(
+        passed=ok,
+        gate="G3 external benefit",
+        clause="3.1.16",
+        detail="no out-of-product benefit relied on" if ok else
+               f"relies on {candidate.external_benefit_pct * 100:.2f}% benefit accruing "
+               f"outside the Financial Product -- may not reduce the EAC",
+    )
+
+
+def gate_charge_shifting_disclosed(policy: Policy,
+                                   baseline: ChargeStructure,
+                                   candidate: ChargeStructure) -> GateResult:
+    """G4. Clauses 3.1.12 / 3.1.13.
+
+    Moving a charge from one EAC component to another is permitted but must be
+    explained in the free text notes. If the total is essentially unchanged and
+    only the component split moved, that is charge-shifting and needs a note.
+    """
+    periods = policy.disclosure_periods()
+    shifting = True
+    worst_comp = 0.0
+    for p in periods:
+        b, c = eac_at(policy, baseline, float(p)), eac_at(policy, candidate, float(p))
+        comp_move = max(abs(c[k] - b[k]) for k in COMPONENTS)
+        worst_comp = max(worst_comp, comp_move)
+        # charge-shifting only if the TOTAL is unchanged at every period while
+        # the component split moves. If the total moves anywhere, the structure
+        # genuinely differs and this is not a shift.
+        if not (comp_move > 0.0015 and abs(c["total"] - b["total"]) < 0.0005):
+            shifting = False
+            break
+    ok = (not shifting) or ("charge-shifting" in candidate.notes.lower())
+    return GateResult(
+        passed=ok,
+        gate="G4 charge-shifting",
+        clause="3.1.12 / 3.1.13",
+        detail="no undisclosed component shift" if ok else
+               f"components moved up to {worst_comp * 100:.2f}% at every disclosure "
+               f"period while the total did not -- requires a free text note",
+    )
+
+
+GATES: tuple[Callable[[Policy, ChargeStructure, ChargeStructure], GateResult], ...] = (
+    gate_revenue_neutral,
+    gate_not_a_disclosure_artefact,
+    gate_no_external_benefit,
+    gate_charge_shifting_disclosed,
+)
+
 
 # ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
+# The single metric + verdict. This is what the ratchet loop reads.
 # ---------------------------------------------------------------------------
 
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
+@dataclass
+class Evaluation:
+    name: str
+    metric: float                      # mean EAC across the four disclosed periods
+    table: dict[int, dict[str, float]]
+    gates: list[GateResult]
+    accepted: bool
+    verdict: str
+    notes: str = ""
 
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
+    @property
+    def failed_gates(self) -> list[GateResult]:
+        return [g for g in self.gates if not g.passed]
 
 
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
+def evaluate(policy: Policy,
+             incumbent: ChargeStructure,
+             candidate: ChargeStructure) -> Evaluation:
+    table = eac_table(policy, candidate)
+    metric = sum(table[p]["total"] for p in policy.disclosure_periods()) / len(
+        policy.disclosure_periods())
 
+    # Gates compare the candidate against the INCUMBENT -- the structure
+    # currently committed to main -- not against the original baseline.
+    # Judging against the baseline lets a gaming move ride in on the back of
+    # earlier honest gains: it still looks better than where we started.
+    # Each experiment must stand on its own diff.
+    results = [gate(policy, incumbent, candidate) for gate in GATES]
+    accepted = all(r.passed for r in results)
 
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
+    if accepted:
+        verdict = "ACCEPT -- commit to main"
     else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
+        first = next(r for r in results if not r.passed)
+        if first.gate.startswith("G2"):
+            verdict = "REJECT -- disclosure artefact, not a real saving"
+        elif first.gate.startswith("G1"):
+            verdict = "ROUTE TO PRODUCT -- changes provider revenue, not a like-for-like finding"
+        else:
+            verdict = f"REJECT -- {first.gate}"
+
+    return Evaluation(name=candidate.name, metric=metric, table=table,
+                      gates=results, accepted=accepted, verdict=verdict,
+                      notes=candidate.notes)
 
 
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
-    """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
-    """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
+def format_evaluation(policy: Policy,
+                      baseline: ChargeStructure,
+                      candidate: ChargeStructure,
+                      ev: Evaluation) -> str:
+    periods = policy.disclosure_periods()
+    base_metric = sum(eac_at(policy, baseline, float(p))["total"] for p in periods) / len(periods)
+    lines = [
+        "=" * 74,
+        f"CANDIDATE: {ev.name}",
+        "=" * 74,
+        "",
+        "BASELINE",
+        format_eac_table(policy, baseline),
+        "",
+        "CANDIDATE",
+        format_eac_table(policy, candidate),
+        "",
+        f"metric (mean disclosed EAC): "
+        f"{ev.metric * 100:.3f}%  vs baseline {base_metric * 100:.3f}%  "
+        f"({(ev.metric - base_metric) * 100:+.3f}pp)",
+        "",
+        "ACCEPTABILITY GATES",
+        "-" * 74,
+    ]
+    for g in ev.gates:
+        mark = "PASS" if g.passed else "FAIL"
+        lines.append(f"  [{mark}] {g.gate:<26} clause {g.clause}")
+        lines.append(f"         {g.detail}")
+    lines += ["", f"VERDICT: {ev.verdict}", ""]
+    if ev.notes:
+        lines += [f"note: {ev.notes}", ""]
+    return "\n".join(lines)
 
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
-
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
-
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
-
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
+# The baseline: a conventional recurring-premium RA as sold today
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
-    """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
-    """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+BASELINE = ChargeStructure(
+    name="baseline-RA",
+    ter=0.0095,
+    transaction_costs=0.0015,
+    initial_advice_pct=0.0330,
+    initial_advice_months=12,
+    ongoing_advice_pct=0.0050,
+    admin_fund_pct=0.0050,
+    admin_fixed_monthly=35.0,
+    termination_pct=0.0,
+    notes="conventional recurring-premium RA, upfront advice fee over year 1",
+)
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+POLICY = Policy()
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
-    args = parser.parse_args()
-
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
-
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
-
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
-
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+    print(f"RA: entry age {POLICY.entry_age}, term to age {RA_LAST_DISCLOSURE_AGE} "
+          f"({POLICY.term_years} years), R{POLICY.monthly_premium:,.0f}/month "
+          f"escalating at {POLICY.premium_escalation * 100:.0f}% p.a.")
+    print(f"Prescribed growth: {PRESCRIBED_GROWTH * 100:.0f}% (para 6.3)\n")
+    print(format_eac_table(POLICY, BASELINE))
