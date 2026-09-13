@@ -1,0 +1,4 @@
+{
+  "name": "actautoresearch",
+  "install": "if ! command -v uv >/dev/null 2>&1 && [ ! -x \"$HOME/.local/bin/uv\" ]; then curl -LsSf https://astral.sh/uv/install.sh | sh; fi; grep -q '.local/bin' \"$HOME/.bashrc\" 2>/dev/null || echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> \"$HOME/.bashrc\"; grep -q '.local/bin' \"$HOME/.profile\" 2>/dev/null || echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> \"$HOME/.profile\"; export PATH=\"$HOME/.local/bin:$PATH\"; uv sync"
+}
